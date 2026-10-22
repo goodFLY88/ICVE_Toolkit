@@ -14,6 +14,7 @@ import json
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Optional, Tuple
 
 from zjy_client import ZjyClient
@@ -24,6 +25,133 @@ _TYPE_MAP = {"1": "作业", "2": "考试", "3": "测验"}
 
 # 低分阈值(低于此分数视为需要重答)
 _LOW_SCORE_THRESHOLD = 60
+
+
+# ==================== MOOC 重叠流水线助手(2026-09-14,仅 MOOC;SPOC/RESOURCE 绝不进) ====================
+
+def mooc_exam_is_exhausted(msg):
+    """205 双语义分流:实测 msg 有两种——「须作答满N分钟」(等即可过)与
+    「您已经达到作答次数上限」(等多久都没用)。后者应跳过不算失败,防死等/死重试。"""
+    m = str(msg or "")
+    return "作答次数" in m and ("上限" in m or "已用完" in m or "用尽" in m)
+
+
+def mooc_exam_window_closed(msg):
+    """205 第三语义分流:「非作答时间禁止进入」=老师设的作答窗口未开放(深夜/未开始/已结束)。
+    与「须作答满N分钟」(等待可过)不同,本卷当下不可答;与「作答次数上限」(永久不可交)也不同——
+    窗口开放后可重刷。成熟度探测与提交批计数共用本判定。"""
+    return "非作答时间" in str(msg or "")
+
+
+def zyk_exam_window_closed(msg):
+    """资源库(zyk 域)作答窗口未开放/已结束的分流判据。
+
+    平台原文实测为 `{"msg":"不在作答时间内，不能作答！！！","code":400}`（作业截止在多年前的那批
+    永远命中它），与 MOOC 的「非作答时间禁止进入」同语义不同字面，故两个子串都认。
+    **仅 RESOURCE 分支使用**（不改 MOOC/SPOC 的判定与日志）。
+    """
+    m = str(msg or "")
+    return ("不在作答时间" in m) or ("非作答时间" in m)
+
+
+def mooc_stagger_open_exams(client, exams, nickname, jitter=0.5):
+    """一次性点开全部未交卷(GET course/exam/paper 有副作用=创建 taskExamRecord,
+    createTime 同批起表)。205 闸门只认 now−createTime wall-clock、与期间干什么无关,
+    故先起表再去刷课件/讨论,等待被自然消耗。个别失败不阻断(降级=提交时才起表、
+    gate_wait 补等满门槛)。返回起表成功数。"""
+    opened = 0
+    for exam in exams:
+        eid = exam.get("id") or exam.get("examId")
+        if not eid:
+            continue
+        try:
+            client.api_get_ai("course/exam/paper", {"id": eid, "groupId": "0"})
+            opened += 1
+        except Exception:
+            pass
+        time.sleep(jitter)
+    if opened:
+        log(f"[{nickname}] 🕒 试卷提前起表:已同时打开 {opened} 张计时,稍后按成熟顺序提交", "INFO")
+    return opened
+
+
+def _mooc_gate_wait(client, exam_id, nickname, buffer_s=60):
+    """MOOC 205 时间闸门真实等待(仅 MOOC + gate_wait 路径调用)。
+
+    平台提交闸门读 now−taskExamRecord.createTime(wall-clock),updateExamTime 叠加值骗不过;
+    门槛分钟数随卷下发于 course/exam/paper.minSubmitDuration(0=无门槛)。
+    本函数真实等满 门槛+buffer 后放行提交;min=0/无记录/读失败 → 立即返回零劣化。"""
+    try:
+        p = client.api_get_ai("course/exam/paper", {"id": exam_id, "groupId": "0"}) or {}
+    except Exception:
+        return 0
+    try:
+        gate_min = int(p.get("minSubmitDuration") or 0)
+    except (TypeError, ValueError):
+        gate_min = 0
+    rec = p.get("taskExamRecord") or {}
+    ct = rec.get("createTime")
+    if gate_min <= 0 or not ct:
+        return 0
+    try:
+        created = datetime.strptime(str(ct), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return 0
+    need = (datetime.now() - created).total_seconds()
+    wait = gate_min * 60 + buffer_s - need
+    if wait <= 0:
+        return 0
+    log(f"[{nickname}] ⏳ 时间闸门:本卷须真实作答满 {gate_min} 分钟,还需等待 {int(wait)} 秒", "INFO")
+    _t0 = time.time()
+    while True:
+        remain = wait - (time.time() - _t0)
+        if remain <= 0:
+            break
+        time.sleep(min(10, remain))
+    waited = int(time.time() - _t0)
+    log(f"[{nickname}] ✅ 时间闸门等待完成({waited}s),开始提交", "INFO")
+    return waited
+
+
+def mooc_exam_gate_remaining(client, exam_id, buffer_s=60):
+    """探测本卷距成熟还差几秒(与 _mooc_gate_wait 同 buffer=60 口径,保证判成熟的卷
+    提交时 gate_wait 零等待)。返回 (remaining_s, gate_min):
+    - gate=0/无门槛 → (0,0) 成熟;
+    - 有门槛且未到期 → (剩余秒, 门槛分);GET paper 顺带起表(新卷 createTime=now,探测即起表);
+    - 205「非作答时间禁止进入」→ 按未成熟返回(留给补交,窗口开放即成功);
+    - 读取异常 → (0,0) 保守放行,提交路径内 gate_wait 仍会兜底补等。"""
+    try:
+        p = client.api_get_ai("course/exam/paper", {"id": exam_id, "groupId": "0"}) or {}
+    except Exception:
+        return 0, 0
+    if isinstance(p, dict) and p.get("code") == 205 and mooc_exam_window_closed(p.get("msg")):
+        return 3600 + buffer_s, 0
+    try:
+        gate_min = int(p.get("minSubmitDuration") or 0)
+    except (TypeError, ValueError):
+        gate_min = 0
+    if gate_min <= 0:
+        return 0, 0
+    rec = p.get("taskExamRecord") or {}
+    ct = rec.get("createTime")
+    if not ct:
+        return gate_min * 60 + buffer_s, gate_min
+    try:
+        created = datetime.strptime(str(ct), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return 0, gate_min
+    need = (datetime.now() - created).total_seconds()
+    rem = gate_min * 60 + buffer_s - need
+    return (rem if rem > 0 else 0), gate_min
+
+
+def _encode_mooc_body(submit_body):
+    """MOOC 提交体编码(对齐官方 web 端抓包实证):Base64(URLEncode(紧凑JSON))。
+    Content-Type: application/json;charset=UTF-8。纯 JSON dict 在含填空题场景曾返回 500。"""
+    import base64 as _b64
+    from urllib.parse import quote as _quote
+    compact = json.dumps(submit_body, ensure_ascii=False, separators=(",", ":"))
+    return _b64.b64encode(_quote(compact, safe="").encode("utf-8")).decode("ascii")
 
 
 # ==================== 考试列表获取 ====================
@@ -53,6 +181,11 @@ def get_course_exams_list(client: ZjyClient, class_id: str, course_info_id: str,
 
 def _get_resource_exams(client: ZjyClient, course_info_id: str, course_id: str) -> list:
     """资源库域:调用 zyk_get_exam_list 获取作业/考试/测验列表。"""
+    if not client.zyk_token and not client.auth_zyk_domain():
+        # 换票失败时平台什么都给不出，不说清就会被当成"这门课没有作业"
+        log(f"[考试列表-资源库] 资源库域换票失败：{getattr(client, 'zyk_auth_msg', '') or '未知原因'}"
+            f" ⇒ 取不到作业/测验列表（这不是「没有作业」），请重新登录", "ERROR")
+        return []
     raw_exams = client.zyk_get_exam_list(course_info_id, course_id)
     result = []
     for e in raw_exams:
@@ -257,7 +390,8 @@ def _is_low_score(exam: dict) -> bool:
 def do_auto_answer_single_exam(client: ZjyClient, nickname: str, exam_id: str,
                                class_id: str, course_info_id: str, course_id: str,
                                ctype: str, title: str, category_id: str,
-                               teacher_token: str = "") -> Tuple[bool, str]:
+                               teacher_token: str = "",
+                               gate_wait: bool = False) -> Tuple[bool, str]:
     """单个考试/作业自动答题主流程。
 
     :param client: ZjyClient 实例
@@ -270,6 +404,7 @@ def do_auto_answer_single_exam(client: ZjyClient, nickname: str, exam_id: str,
     :param title: 考试标题
     :param category_id: "1"=作业 "2"=考试 "3"=测验
     :param teacher_token: 教师号 token(可选,默认空字符串)
+    :param gate_wait: MOOC 重叠流水线模式——提交前真实等满时间闸门(仅 MOOC 生效)
     :return: (ok: bool, msg: str)
     """
     if not exam_id:
@@ -284,7 +419,7 @@ def do_auto_answer_single_exam(client: ZjyClient, nickname: str, exam_id: str,
         else:
             return _do_spoc_mooc_answer(client, nickname, exam_id, class_id,
                                         course_info_id, course_id, ctype, title,
-                                        category_id, teacher_token)
+                                        category_id, teacher_token, gate_wait)
     except Exception as e:
         log(f"[{nickname}] 答题异常: {e}", "ERROR")
         return False, f"答题异常: {e}"
@@ -318,9 +453,15 @@ def _do_resource_answer(client: ZjyClient, nickname: str, exam_id: str,
         log(f"[{nickname}] ✅ {title}: {msg}", "SUCCESS")
         return True, msg
 
-    err_msg = result.get("msg", "提交失败") if result else "提交请求失败"
-    log(f"[{nickname}] ❌ {title}: {err_msg}", "WARNING")
-    return False, err_msg
+    # `zyk_submit_exam` 已把平台原始响应放在 fail_details 里，但只取 msg 就只剩"提交失败"四个字。
+    # 实测这一类失败绝大多数是平台按作答窗口拒绝（原文 `不在作答时间内，不能作答！！！` code=400），
+    # 属于"本来就不该交"，不是链坏了 ⇒ 把平台 code/msg 抬进日志与返回值，供上层分流。
+    _fd = result.get("fail_details") if isinstance(result, dict) else None
+    _fd = _fd if isinstance(_fd, dict) else {}
+    _pmsg = str(_fd.get("msg") or "").strip()
+    err_msg = _pmsg or (result.get("msg", "提交失败") if result else "提交请求失败")
+    log(f"[{nickname}] ❌ {title}: 资源库提交失败 code={_fd.get('code')} msg={err_msg[:80]}", "WARNING")
+    return False, f"资源库提交失败: {err_msg}"
 
 
 # ==================== SPOC / MOOC 答题 ====================
@@ -328,7 +469,7 @@ def _do_resource_answer(client: ZjyClient, nickname: str, exam_id: str,
 def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
                          class_id: str, course_info_id: str, course_id: str,
                          ctype: str, title: str, category_id: str,
-                         teacher_token: str) -> Tuple[bool, str]:
+                         teacher_token: str, gate_wait: bool = False) -> Tuple[bool, str]:
     """SPOC/MOOC 答题:答案检索 → 教师号补充 → 题库兜底 → 构建payload → 提交。"""
     # 1. 答案检索(学生号直取 + 同学扫包)
     questions, record = client.find_classmate_answers(
@@ -383,11 +524,9 @@ def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
             min_time = random.randint(300, 500)
         else:
             min_time = random.randint(60, 180)
-        # SPOC考试需真实等待,限制最大180秒
-        if str(category_id) == "2":
-            exam_time = min(exam_time, 180)
-        else:
-            exam_time = max(min_time, min(exam_time, random.randint(1600, 1900)))
+        # SPOC 考试(category_id=2)须满足平台最小时长闸门(否则 examTime 字段必被拒)；
+        # 对齐 MOOC 的 max(min_time, ...) 逻辑，不再用 180 秒硬上限压掉 min_time
+        exam_time = max(min_time, min(exam_time, random.randint(1600, 1900)))
 
     task_id = ""
     if record and isinstance(record, dict):
@@ -395,20 +534,22 @@ def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
 
     # 6. 提交
     if ctype == "MOOC":
-        result = _submit_mooc_exam(client, nickname, exam_id, class_id,
-                                   course_info_id, course_id, category_id,
-                                   task_id, questions, exam_time, title)
+        ok, result = _submit_mooc_exam(client, nickname, exam_id, class_id,
+                                        course_info_id, course_id, category_id,
+                                        task_id, questions, exam_time, title,
+                                        gate_wait=gate_wait)
     else:
         result = _submit_spoc_exam(client, nickname, exam_id, class_id,
                                    course_info_id, course_id, category_id,
                                    task_id, questions, exam_time, title)
+        ok = bool(result and result.get("code") == 200)
 
-    if result and result.get("code") == 200:
-        msg = result.get("msg", "提交成功")
+    if ok:
+        msg = (result or {}).get("msg", "提交成功")
         log(f"[{nickname}] ✅ {title}: {msg} (有答案 {final_has_answer}/{len(questions)} 题)", "SUCCESS")
         return True, msg
 
-    err_msg = result.get("msg", "提交失败") if result else "提交请求失败"
+    err_msg = (result or {}).get("msg", "提交失败") if result else "提交请求失败"
     log(f"[{nickname}] ❌ {title}: {err_msg}", "WARNING")
     return False, err_msg
 
@@ -418,18 +559,21 @@ def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
 def _submit_mooc_exam(client: ZjyClient, nickname: str, exam_id: str,
                       class_id: str, course_info_id: str, course_id: str,
                       category_id: str, task_id: str, questions: list,
-                      exam_time: int, title: str = "") -> Optional[dict]:
-    """MOOC 提交:先 updateExamTime 累加时长(每 10 秒一次),再 POST course/exam/record。
+                      exam_time: int, title: str = "",
+                      gate_wait: bool = False) -> Tuple[bool, Optional[dict]]:
+    """MOOC 提交:updateExamTime 累加时长 → (gate_wait 真实等满闸门) → POST course/exam/record。
 
-    对齐商业版:
-    - payload 用 id(非 taskId)、含 examName/device/groupId
-    - updateExamTime 查询已累加值只补差值,有熔断保护和重新认证
-    - 失败后删除旧记录重试一次
+    对齐生产版(2026-09-14/16):
+    - 提交体 Base64(URLEncode(紧凑JSON)) 编码(纯 JSON dict 含填空题曾返回 500)
+    - gate_wait=True:提交前真实等满 now−createTime 时间闸门(updateExamTime 叠加值骗不过,实验证)
+    - 205「作答次数上限」→ 直接跳过不 delete 重试(重试白白重置计时且注定再败),msg 透传调用方分流
+    - 其余失败 → 删除旧记录重新起表再提交(重建已把 createTime 归零,gate_wait 模式须对新记录再等满)
+    返回 (ok, result_or_None)。
     """
-    # 1. updateExamTime 累加作答时长(对齐商业版:查已累加值、熔断、重新认证)
+    # 1. updateExamTime 累加作答时长(查已累加值只补差值、熔断、重新认证)
     _mooc_update_exam_time(client, exam_id, course_info_id, course_id, exam_time, task_id, nickname)
 
-    # 2. 构建 taskExamProblemRecordList(对齐商业版:仅 questionNo/paperId/answer,无 optionSort)
+    # 2. 构建 taskExamProblemRecordList(仅 questionNo/paperId/answer,无 optionSort)
     records = []
     for i, q in enumerate(questions):
         type_id = _get_type_id(q)
@@ -461,7 +605,7 @@ def _submit_mooc_exam(client: ZjyClient, nickname: str, exam_id: str,
                 pass
         records.append({"questionNo": i, "paperId": paper_id, "answer": str(answer)})
 
-    # 3. 构建提交 payload(对齐商业版字段)
+    # 3. 构建提交 payload
     payload = {
         "courseId": course_id,
         "courseInfoId": course_info_id,
@@ -481,31 +625,53 @@ def _submit_mooc_exam(client: ZjyClient, nickname: str, exam_id: str,
     # 刷新 AI Token
     client.auth_ai_domain()
 
-    # 提交(对齐商业版:401 自动重认证,手动处理重试)
+    # 提交(对齐官方 web 端:Body=Base64(URLEncode(紧凑JSON));401 自动重认证重试一次)
+    mooc_fail_msg = ""
+
     def _do_submit(submit_body):
-        headers = {}
-        if client.ai_token:
-            headers["Authorization"] = client.ai_token if client.ai_token.startswith("Bearer ") else f"Bearer {client.ai_token}"
+        nonlocal mooc_fail_msg
+        headers = {"Content-Type": "application/json;charset=UTF-8"}
+        ai_tok = client.ai_token
+        if ai_tok:
+            headers["Authorization"] = ai_tok if ai_tok.startswith("Bearer ") else f"Bearer {ai_tok}"
+        encoded = _encode_mooc_body(submit_body)
         try:
             resp = client.session.post("https://ai.icve.com.cn/prod-api/course/exam/record",
-                                       json=submit_body, headers=headers, timeout=30)
+                                       data=encoded, headers=headers, timeout=30)
             if resp.status_code == 401:
                 client.auth_ai_domain()
-                if client.ai_token:
-                    headers["Authorization"] = client.ai_token if client.ai_token.startswith("Bearer ") else f"Bearer {client.ai_token}"
+                ai_tok2 = client.ai_token
+                if ai_tok2:
+                    headers["Authorization"] = ai_tok2 if ai_tok2.startswith("Bearer ") else f"Bearer {ai_tok2}"
                 resp = client.session.post("https://ai.icve.com.cn/prod-api/course/exam/record",
-                                           json=submit_body, headers=headers, timeout=30)
+                                           data=encoded, headers=headers, timeout=30)
             if resp.status_code == 200:
-                return resp.json()
+                j = resp.json()
+                if j.get("code") == 200:
+                    return True, j
+                if j.get("code") == 205 and j.get("msg"):
+                    mooc_fail_msg = str(j.get("msg"))
+                return False, j
         except Exception as e:
             log(f"[{nickname}] [MOOC提交] 异常: {e}", "ERROR")
-        return None
+        return False, None
 
-    result = _do_submit(payload)
-    if result and result.get("code") == 200:
-        return result
+    # 时间闸门真实等待(仅 gate_wait 的主动答题入口;放在 updateExamTime 之后,
+    # 累加循环已消耗的 wall-clock 一并计入)
+    if gate_wait:
+        _mooc_gate_wait(client, exam_id, nickname)
 
-    # 失败后删除旧记录重试(对齐商业版)
+    submitted, result = _do_submit(payload)
+    if submitted:
+        return True, result
+
+    # 205「作答次数上限」:等多久/重试都没用(平台硬拒),跳过 delete+重试
+    # (重试会白白重置计时),由调用方按 msg 分流不记失败。
+    if mooc_exam_is_exhausted(mooc_fail_msg):
+        log(f"[{nickname}] ⏭ {title}:{mooc_fail_msg},跳过重试(等待/重交均无效)", "INFO")
+        return False, {"code": 205, "msg": mooc_fail_msg}
+
+    # 其余失败:删除旧记录重新起表再提交
     log(f"[{nickname}] [MOOC提交] 首次提交失败,尝试删除旧记录后重试...", "WARNING")
     try:
         client.api_post_ai("course/exam/record/delete", {
@@ -514,7 +680,6 @@ def _submit_mooc_exam(client: ZjyClient, nickname: str, exam_id: str,
         })
     except Exception:
         pass
-    # 重新获取考试记录
     new_paper_data = client.api_get_ai("course/exam/paper", {"id": exam_id, "groupId": "0"})
     if new_paper_data and new_paper_data.get("questions"):
         new_record = new_paper_data.get("taskExamRecord") or {}
@@ -522,12 +687,17 @@ def _submit_mooc_exam(client: ZjyClient, nickname: str, exam_id: str,
         if new_rec_id:
             new_body = dict(payload)
             new_body["id"] = new_rec_id
-            # 重新累加时长
+            # 新记录计时归零,需完整重新累加
             _mooc_update_exam_time(client, exam_id, course_info_id, course_id, exam_time, new_rec_id, nickname)
+            # delete+重建已把 createTime 归零,gate_wait 模式必须对新记录再等满门槛
+            if gate_wait:
+                _mooc_gate_wait(client, exam_id, nickname)
             client.auth_ai_domain()
-            result = _do_submit(new_body)
+            submitted, result = _do_submit(new_body)
+            if submitted:
+                return True, result
 
-    return result
+    return False, result
 
 
 def _mooc_update_exam_time(client: ZjyClient, exam_id: str, course_info_id: str,
@@ -551,7 +721,10 @@ def _mooc_update_exam_time(client: ZjyClient, exam_id: str, course_info_id: str,
 
     interval = 10
     need_add = max(interval, exam_time - current_exam_time)
-    rounds = need_add // interval
+    # 反指纹(2026-09-16 生产移植):步进不再恒 10(恒 10 → 平台记录几乎全是 10 的倍数)。
+    # 每轮 rand(8,13),rounds 按期望均值 10.5 折算,总时长仍≈exam_time;至少调 1 次保持活跃。
+    _STEP_MIN, _STEP_MAX = 8, 13
+    rounds = max(1, int(round(need_add / ((_STEP_MIN + _STEP_MAX) / 2))))
 
     update_payload = {
         "courseId": course_id, "courseInfoId": course_info_id,
@@ -561,11 +734,15 @@ def _mooc_update_exam_time(client: ZjyClient, exam_id: str, course_info_id: str,
 
     success_count = 0
     fail_streak = 0
+    _accum_s = 0  # 实际累计秒数(随机步进)
     for r in range(rounds):
         try:
+            _step = random.randint(_STEP_MIN, _STEP_MAX)
+            update_payload["examTime"] = _step
             result = client.api_post_ai("course/exam/record/updateExamTime", update_payload)
             if result and result.get("code") == 200:
                 success_count += 1
+                _accum_s += _step
                 fail_streak = 0
             elif r == 0 and (not result or result.get("code") != 200):
                 # 首次失败,重新认证 AI 域名重试
@@ -574,6 +751,7 @@ def _mooc_update_exam_time(client: ZjyClient, exam_id: str, course_info_id: str,
                 result = client.api_post_ai("course/exam/record/updateExamTime", update_payload)
                 if result and result.get("code") == 200:
                     success_count += 1
+                    _accum_s += _step
                     fail_streak = 0
                 else:
                     fail_streak += 1
@@ -588,7 +766,7 @@ def _mooc_update_exam_time(client: ZjyClient, exam_id: str, course_info_id: str,
         if r < rounds - 1:
             time.sleep(1)
 
-    log(f"[{nickname}] [MOOC] updateExamTime: {success_count}/{rounds}次成功, 新增约{success_count * interval}秒 (已有{current_exam_time}秒)", "INFO")
+    log(f"[{nickname}] [MOOC] updateExamTime: {success_count}/{rounds}次成功, 新增约{_accum_s}秒 (已有{current_exam_time}秒)", "INFO")
 
 
 # ==================== SPOC 提交 ====================
@@ -715,7 +893,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
         if student_data_json:
             try:
                 student_opts = json.loads(student_data_json) if isinstance(student_data_json, str) else student_data_json
-            except Exception:
+            except:
                 pass
 
         if type_id in ["1", "2"]:
@@ -728,7 +906,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                     if cq_data:
                         try:
                             classmate_opts = json.loads(cq_data) if isinstance(cq_data, str) else cq_data
-                        except Exception:
+                        except:
                             pass
                 full_opts = []
                 ans_sos_set = set(x.strip() for x in final_answer.split(",") if x.strip())
@@ -752,7 +930,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                     if cq_data:
                         try:
                             classmate_opts = json.loads(cq_data) if isinstance(cq_data, str) else cq_data
-                        except Exception:
+                        except:
                             pass
                 full_opts = []
                 ans_val = str(raw_answer).strip()
@@ -779,7 +957,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                     parsed = json.loads(str(raw_answer))
                     if isinstance(parsed, list):
                         ans_list = [str(x) for x in parsed]
-                except Exception:
+                except:
                     pass
             if not ans_list and type_id == "4" and classmate_q:
                 cq_data = classmate_q.get("dataJson") or classmate_q.get("optionSort")
@@ -790,7 +968,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                             extracted = [str(opt.get("Content", "")).strip() for opt in cq_opts]
                             if any(extracted):
                                 ans_list = extracted
-                    except Exception:
+                    except:
                         pass
             if not ans_list and raw_answer:
                 if "," in str(raw_answer):
@@ -912,7 +1090,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                     rows2 = rec_data2["data"] if isinstance(rec_data2["data"], list) else rec_data2["data"].get("rows", [])
                     if rows2:
                         record_id = rows2[0].get("id") or rows2[0].get("recordId")
-            except Exception:
+            except:
                 pass
 
         interval = 10
@@ -933,7 +1111,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                 if result and result.get("code") == 200:
                     spoc_success += 1
                     spoc_fail_streak = 0
-            except Exception:
+            except:
                 spoc_fail_streak += 1
             if spoc_fail_streak >= 5:
                 log(f"[{nickname}] SPOC updateExamTime连续5次失败,熔断停止 (已完成{spoc_success}/{rounds})", "WARNING")
@@ -944,6 +1122,40 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
             log(f"[{nickname}] SPOC updateExamTime: {spoc_success}/{rounds}次成功, 累计约{spoc_success * interval}秒", "INFO")
 
     return {"code": 200, "msg": "提交成功"} if submitted else {"code": 500, "msg": "提交失败"}
+
+
+# ==================== 提交记录构建 ====================
+
+def _build_submit_records(questions: list) -> list:
+    """构建 taskExamProblemRecordList,每题含 questionNo/paperId/answer/optionSort。
+
+    :param questions: 题目列表
+    :return: 提交记录列表
+    """
+    records = []
+    for idx, q in enumerate(questions):
+        type_id = _get_type_id(q)
+        paper_id = str(q.get("paperId") or q.get("id") or q.get("questionId") or "")
+        answer = _convert_answer_for_submit(q, type_id)
+
+        record = {
+            "questionNo": idx,
+            "paperId": paper_id,
+            "answer": answer,
+            "optionSort": "",
+        }
+
+        # optionSort: 仅选择题(typeId=1/2)需要,从 dataJson 或 optionSort 字段提取
+        if type_id in ("1", "2") and answer:
+            opt_sort = q.get("optionSort") or q.get("dataJson") or ""
+            if opt_sort:
+                if isinstance(opt_sort, str):
+                    record["optionSort"] = opt_sort
+                else:
+                    record["optionSort"] = json.dumps(opt_sort, ensure_ascii=False)
+
+        records.append(record)
+    return records
 
 
 # ==================== 答案格式转换 ====================
@@ -1144,6 +1356,7 @@ def run_auto_answer_all_task(client: ZjyClient, nickname: str, class_id: str,
         log(f"[{nickname}] 发现 {len(unsubmitted)} 个待答题任务,开始逐一答题...", "INFO")
         success = 0
         fail = 0
+        window_skip = 0
         for idx, exam in enumerate(unsubmitted, 1):
             exam_id = exam.get("id") or exam.get("examId")
             title = exam.get("title", "未命名任务")
@@ -1160,11 +1373,15 @@ def run_auto_answer_all_task(client: ZjyClient, nickname: str, class_id: str,
             )
             if ok:
                 success += 1
+            elif ctype == "RESOURCE" and zyk_exam_window_closed(msg):
+                # 平台按作答窗口拒绝（作业截止多年的那批），SPOC/MOOC 此计数恒 0 ⇒ 汇总串逐字不变
+                window_skip += 1
             else:
                 fail += 1
             # 任务间隔
             time.sleep(1)
 
-        log(f"[{nickname}] 🎉 批量答题结束:成功 {success} 个,失败 {fail} 个", "INFO")
+        _wtail = f",窗口未开放/已结束跳过 {window_skip} 个" if window_skip else ""
+        log(f"[{nickname}] 🎉 批量答题结束:成功 {success} 个,失败 {fail} 个{_wtail}", "INFO")
     except Exception as e:
         log(f"[{nickname}] 批量答题异常: {e}", "ERROR")

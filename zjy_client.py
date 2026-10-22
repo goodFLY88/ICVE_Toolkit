@@ -10,15 +10,24 @@ import json
 import os
 import re
 import struct
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Union
 from urllib.parse import quote
 
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
+from requests.adapters import HTTPAdapter
 
 from utils import log
+
+# 连接池上限：requests 默认只缓存 10 条连接，刷课车道数一超过 10 就开始
+# "建连→用完即弃"，每条请求重付一次 TLS 握手（实测单条 RTT 从 ~0.07s 涨到 ~0.20s，
+# 12 车道反而比旧的格内并发更慢）。故显式放大到能容纳车道并发的量级。
+POOL_CONNECTIONS = 10
+POOL_MAXSIZE = 24
 
 # ==================== 域名常量 ====================
 BASE_URL = "https://zjy2.icve.com.cn/prod-api"        # 主域(SPOC/MOOC 课程)
@@ -26,12 +35,113 @@ AI_BASE_URL = "https://ai.icve.com.cn/prod-api"        # AI 域(MOOC 课程设�
 ZYK_BASE_URL = "https://zyk.icve.com.cn/prod-api"      # 资源库域
 SSO_BASE = "https://sso.icve.com.cn"                   # SSO 单点登录域
 
+# AI 域换票锁:passLogin 一次一张票,并发线程各自换票会把票数放大成"风暴"
+# (实测并发 3/8/16 → passLogin 3/8/16 次,扫描起头白等 0.75/2.0/4.0s),
+# 故冷会话补鉴权走 ensure_ai_token 的双检锁。
+_AI_AUTH_LOCK = threading.Lock()
+
 # 视频防盗链 Referer(反编译确认官方 H5 带此 header)
 _VIDEO_REFERER = {"Referer": "https://zjy2.icve.com.cn/prod-api/"}
 
 # 图片类型集合(刷课时长豁免)
 IMAGE_TYPES = {"image", "图片", "图文", "picture", "photo", "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg"}
 VIDEO_TYPES = {"video", "audio", "mp4", "flv", "视频", "音频", "m3u8", "avi", "mov"}
+# 音频课件类型(时长解析分流:先 MP3 解析,失败回落 MP4——对齐生产 2026-09-16 消噪修复)
+AUDIO_TYPES = {"audio", "音频"}
+
+# MP3 帧头解析常量(生产 backend/zjy_client.py 同源移植)
+_MP3_BR_V1L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
+_MP3_BR_V2L3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0]
+_MP3_SR = {3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000]}
+
+
+def _mp3_skip_id3v2(data: bytes) -> int:
+    """ID3v2 标签 → 返回其后偏移；无标签返回 0"""
+    if len(data) >= 10 and data[:3] == b"ID3":
+        size = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) | \
+               ((data[8] & 0x7F) << 7) | (data[9] & 0x7F)
+        return 10 + size
+    return 0
+
+
+def _mp3_frame_header(data: bytes, p: int):
+    """解析 p 处 MPEG1/2 Layer III 帧头，非法返回 None"""
+    if p + 4 > len(data) or data[p] != 0xFF or (data[p + 1] & 0xE0) != 0xE0:
+        return None
+    b1, b2 = data[p + 1], data[p + 2]
+    version, layer = (b1 >> 3) & 0x03, (b1 >> 1) & 0x03
+    if version == 1 or layer != 1:          # 只支持 Layer III（网络音频绝对主流）
+        return None
+    br_idx, sr_idx = (b2 >> 4) & 0x0F, (b2 >> 2) & 0x03
+    if sr_idx == 3 or br_idx in (0, 15):
+        return None
+    bitrate = (_MP3_BR_V1L3 if version == 3 else _MP3_BR_V2L3)[br_idx]
+    if bitrate <= 0:
+        return None
+    return {"version": version, "bitrate": bitrate,
+            "samplerate": _MP3_SR[version][sr_idx],
+            "spf": 1152 if version == 3 else 576,
+            "channel": (data[p + 3] >> 6) & 0x03}
+
+
+def _parse_mp3_duration_bytes(data: bytes) -> Optional[int]:
+    """从字节流解析 MP3 时长（秒）；非 MP3/无精确帧数头返回 None。纯函数。"""
+    if len(data) < 4:
+        return None
+    if data[4:8] == b"ftyp" or data[:3] == b"\x00\x00\x01":
+        return None                          # MP4/MPEG-PS 容器 → 交回 MP4 解析
+    off = _mp3_skip_id3v2(data)
+    h = None
+    frame_at = -1
+    for p in range(off, min(off + 8, len(data) - 4)):
+        h = _mp3_frame_header(data, p)
+        if h:
+            frame_at = p
+            break
+    if not h:
+        return None
+    side = (32 if h["channel"] != 3 else 17) if h["version"] == 3 \
+        else (17 if h["channel"] != 3 else 9)
+    scan = data[frame_at + 4: frame_at + 4 + side + 96]
+    for tag in (b"Xing", b"Info", b"VBRI"):
+        i = scan.find(tag)
+        if i == -1:
+            continue
+        if tag == b"VBRI":
+            # 标准 VBRI 头：Frame Count 在 tag+16（实测边界需 i+20）
+            if i + 20 > len(scan):
+                continue
+            frames = struct.unpack_from(">I", scan, i + 16)[0]
+        else:
+            if i + 12 > len(scan):
+                continue
+            if not (struct.unpack_from(">I", scan, i + 4)[0] & 1):
+                continue
+            frames = struct.unpack_from(">I", scan, i + 8)[0]
+        if frames:
+            return int(round(frames * h["spf"] / h["samplerate"]))
+    return None
+
+
+def get_mp3_duration(url: str) -> Optional[int]:
+    """Range 请求解析 MP3 时长（秒），失败返回 None。1 次 GET 即命中（实测 50ms，
+    比 MP4 三策略全失败的 300ms 快 6 倍）；大 ID3v2 标签时二次 Range 精读。"""
+    try:
+        r = requests.get(url, headers={**{"Range": "bytes=0-65535"}, **_VIDEO_REFERER}, timeout=15)
+        if r.status_code not in (200, 206):
+            return None
+        data = r.content
+        off = _mp3_skip_id3v2(data)
+        if off >= len(data) - 4:             # ID3v2 标签超出首窗 → 二次精读
+            r2 = requests.get(url, headers={**{"Range": f"bytes={off}-{off + 65535}"},
+                                            **_VIDEO_REFERER}, timeout=15)
+            if r2.status_code not in (200, 206) or len(r2.content) < 4:
+                return None
+            data = r2.content
+        return _parse_mp3_duration_bytes(data)
+    except Exception:
+        pass
+    return None
 
 
 class ZjyClient:
@@ -44,6 +154,9 @@ class ZjyClient:
     def __init__(self, token: Optional[str] = None, sso_token: Optional[str] = None,
                  question_bank_dir: Optional[str] = None, accounts: Optional[dict] = None):
         self.session = requests.Session()
+        _adapter = HTTPAdapter(pool_connections=POOL_CONNECTIONS, pool_maxsize=POOL_MAXSIZE)
+        self.session.mount("https://", _adapter)
+        self.session.mount("http://", _adapter)
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36",
             "log-equipment-app-version": "2.5.6",
@@ -58,6 +171,12 @@ class ZjyClient:
         self.stu_id: Optional[str] = None
         self.ai_token: Optional[str] = None
         self.zyk_token: Optional[str] = None
+        # 换票失败原因（平台原话）：此前 allowLogin=false 被直接吞掉，日志里连一行都没有，
+        # 用户只能看到"没有扫描到可刷的课件"，误以为功能坏了。
+        self.ai_auth_msg: str = ""
+        self.zyk_auth_msg: str = ""
+        # 读请求异常次数：**"没读到"不等于"没有内容"**，扫描返回 0 时靠它区分两者
+        self.net_err: int = 0
         # 题库目录(可选):无则跳过题库兜底
         self.question_bank_dir: Optional[str] = question_bank_dir
         # 同学账号 token 字典(可选):{nickname: {"token":..., "stuId":...}}
@@ -96,8 +215,8 @@ class ZjyClient:
                 if not self.stu_id:
                     self.stu_id = str(self.user_info.get("userId", ""))
 
-                # 自动尝试 AI 域认证
-                self.auth_ai_domain()
+                # AI 域鉴权延迟到首次访问 AI 接口时(api_*_ai 内自动补鉴权):
+                # 登录链路少一个串行 RTT,而只有 MOOC 讨论/考试才用得到 AI 域
                 return True
             else:
                 log(f"apply_token 失败: HTTP {resp.status_code}", "WARNING")
@@ -129,11 +248,55 @@ class ZjyClient:
             log(f"refresh_token_from_sso 异常: {e}", "ERROR")
             return False
 
+    def mooc_completed_cells(self, course_info_id, course_id):
+        """平台口径的"已学完"课件 id 集合（=页面 N/M 的 N）；读不到返回 None（区别于空集）。"""
+        try:
+            data = self.api_get_ai("course/studyRecord/completed/courseware", {
+                "courseInfoId": course_info_id, "courseId": course_id})
+        except Exception:
+            return None
+        if not isinstance(data, dict) or data.get("code") != 200:
+            return None
+        rows = data.get("data")
+        return {str(x) for x in rows} if isinstance(rows, list) else set()
+
+    def mooc_total_study_minutes(self, course_info_id, course_id):
+        """全课累计学习时长（分钟）。
+
+        读口 `getCellStudyList` 忽略分页且同一课件可能多行，故按 sourceId 取最大值再求和；
+        读不到返回 None。
+        """
+        try:
+            data = self.api_get_ai("course/studyRecord/getCellStudyList", {
+                "pageNum": "1", "pageSize": "300",
+                "courseInfoId": course_info_id, "courseId": course_id})
+        except Exception:
+            return None
+        rows = (data or {}).get("rows") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return None
+        best = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                best[str(r.get("sourceId"))] = max(best.get(str(r.get("sourceId")), 0.0),
+                                                   float(r.get("studyDurations") or 0))
+            except (TypeError, ValueError):
+                continue
+        return sum(best.values()) / 60.0
+
     def auth_ai_domain(self) -> bool:
-        """AI 域鉴权:用 sso_token(优先)或 token 换 ai_token。"""
+        """AI 域鉴权:用 sso_token(优先)或 token 换 ai_token。
+
+        失败原因留在 `self.ai_auth_msg`（平台的 `notAllowLoginMsg` 原话）——官方在"登录态过期"时
+        回的是 HTTP 200 + `{"code":200,"data":{"allowLogin":false,...}}`，吞掉它就只会表现为
+        "MOOC 课件树扫出 0 个课件"，用户无从知道是登录态问题。
+        """
         try:
             auth_token = self.sso_token or self.token
             if not auth_token:
+                self.ai_auth_msg = "本地无 token（未登录）"
                 return False
             clean_headers = {k: v for k, v in self.session.headers.items()
                              if k.lower() not in ("authorization", "x-ai-token")}
@@ -150,8 +313,16 @@ class ZjyClient:
                     if ai_token:
                         self.ai_token = ai_token
                         self.session.headers["X-AI-Token"] = f"Bearer {ai_token}"
+                        self.ai_auth_msg = ""
                         return True
+                self.ai_auth_msg = _passlogin_reject(data)
+                log(f"[AI鉴权] 换票被拒：{self.ai_auth_msg}", "WARNING")
+                return False
+            self.ai_auth_msg = f"AI 域 passLogin HTTP {resp.status_code}"
+            log(f"[AI鉴权] {self.ai_auth_msg}", "WARNING")
         except Exception as e:
+            self.net_err += 1
+            self.ai_auth_msg = f"AI 域换票请求异常: {e}"
             log(f"auth_ai_domain 异常: {e}", "ERROR")
         return False
 
@@ -160,10 +331,12 @@ class ZjyClient:
 
         抓包确认:GET https://zyk.icve.com.cn/prod-api/auth/passLogin?token=<ssoToken>
         返回 {code:200, data:{access_token, expires_in:1440}}
+        失败原因同样留在 `self.zyk_auth_msg`（吞掉时表现为"资源库一门课都列不出来"）。
         """
         try:
             auth_token = self.sso_token or self.token
             if not auth_token:
+                self.zyk_auth_msg = "本地无 token（未登录）"
                 return False
             clean_headers = {k: v for k, v in self.session.headers.items()
                              if k.lower() not in ("authorization", "x-ai-token")}
@@ -180,8 +353,16 @@ class ZjyClient:
                     zyk_token = _extract_access_token(data)
                     if zyk_token:
                         self.zyk_token = zyk_token
+                        self.zyk_auth_msg = ""
                         return True
+                self.zyk_auth_msg = _passlogin_reject(data)
+                log(f"[资源库鉴权] 换票被拒：{self.zyk_auth_msg}", "WARNING")
+                return False
+            self.zyk_auth_msg = f"资源库域 passLogin HTTP {resp.status_code}"
+            log(f"[资源库鉴权] {self.zyk_auth_msg}", "WARNING")
         except Exception as e:
+            self.net_err += 1
+            self.zyk_auth_msg = f"资源库域换票请求异常: {e}"
             log(f"auth_zyk_domain 异常: {e}", "ERROR")
         return False
 
@@ -267,54 +448,91 @@ class ZjyClient:
 
     # ==================== AI 域 API(401 自动重新鉴权) ====================
 
-    def api_get_ai(self, path: str, params: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
-        """AI 域 GET,401 时自动重新鉴权重试一次。"""
-        try:
-            headers = {}
+    def ensure_ai_token(self) -> bool:
+        """无票时补一次 AI 域鉴权;并发下只让第一个线程真打 passLogin,其余复用已换到的票。
+
+        只作用于"起手无票"这一种情况;401 懒重鉴权路径保持原样(不在此复用他人新票)。
+        """
+        if self.ai_token:
+            return True
+        with _AI_AUTH_LOCK:
             if self.ai_token:
-                headers["Authorization"] = f"Bearer {self.ai_token}"
-            resp = self.session.get(f"{AI_BASE_URL}/{path}", params=params, headers=headers, timeout=timeout)
-            if resp.status_code == 401:
-                self.auth_ai_domain()
-                if self.ai_token:
-                    headers["Authorization"] = f"Bearer {self.ai_token}"
-                resp = self.session.get(f"{AI_BASE_URL}/{path}", params=params, headers=headers, timeout=timeout)
+                return True
+            return self.auth_ai_domain()
+
+    def _ai_headers(self) -> dict:
+        """AI 域请求头;token 缺失(登录后未鉴权)时先补一次 AI 域鉴权。
+
+        apply_token 不再主动鉴权 AI 域,故冷会话的第一次 AI 调用在这里补齐。
+        """
+        if not self.ai_token:
+            self.ensure_ai_token()
+        return {"Authorization": f"Bearer {self.ai_token}"} if self.ai_token else {}
+
+    def _ai_auth_rejected(self, status: int, body) -> bool:
+        """判断一次 AI 域响应是不是"登录态失效"。
+
+        实测：官方把鉴权失效包在 **HTTP 200 + body `{"code":401,"msg":"登录状态已过期"}`** 里返回，
+        所以只盯 HTTP 状态码的旧逻辑永远不会重鉴权（表现为"课程树扫出 0 个课件"，被误当成没课件）。
+        """
+        if status == 401:
+            return True
+        return isinstance(body, dict) and body.get("code") == 401
+
+    def _ai_request(self, verb: str, path: str, params=None, body=None, timeout: int = 10):
+        """AI 域请求内核：发一次 → 若是登录态失效就换票重发一次。
+
+        三种返回口径保持不变：HTTP 200 时返回解析后的 dict，否则 None；
+        唯一新增的是"body 级 401 也会先重鉴权再试一次"。
+        """
+        url = f"{AI_BASE_URL}/{path}"
+
+        def _send():
+            headers = self._ai_headers()
+            if verb == "GET":
+                return self.session.get(url, params=params, headers=headers, timeout=timeout)
+            if verb == "POST":
+                return self.session.post(url, json=body, headers=headers, timeout=timeout)
+            return self.session.put(url, json=body, headers=headers, timeout=timeout)
+
+        try:
+            resp = _send()
+            parsed = None
             if resp.status_code == 200:
-                return resp.json()
+                try:
+                    parsed = resp.json()
+                except Exception:
+                    parsed = None
+            if self._ai_auth_rejected(resp.status_code, parsed):
+                # 鉴权失效属于"读不到"，计入 net_err 供上层区分"没课件"
+                self.net_err += 1
+                if self.auth_ai_domain():
+                    resp = _send()
+                    if resp.status_code == 200:
+                        try:
+                            return resp.json()
+                        except Exception:
+                            return None
+                    return None
+                return parsed
+            if resp.status_code == 200:
+                return parsed
         except Exception as e:
-            log(f"GET(AI) {path} 异常: {e}", "ERROR")
+            self.net_err += 1
+            log(f"{verb.upper()}(AI) {path} 异常: {e}", "ERROR")
         return None
+
+    def api_get_ai(self, path: str, params: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
+        """AI 域 GET；登录态失效（含 body 级 code=401）时自动换票重试一次。"""
+        return self._ai_request("GET", path, params=params, timeout=timeout)
 
     def api_post_ai(self, path: str, body: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
-        """AI 域 POST,401 时自动重新鉴权重试一次。"""
-        try:
-            headers = {}
-            if self.ai_token:
-                headers["Authorization"] = f"Bearer {self.ai_token}"
-            resp = self.session.post(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
-            if resp.status_code == 401:
-                self.auth_ai_domain()
-                if self.ai_token:
-                    headers["Authorization"] = f"Bearer {self.ai_token}"
-                resp = self.session.post(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            log(f"POST(AI) {path} 异常: {e}", "ERROR")
-        return None
+        """AI 域 POST；登录态失效（含 body 级 code=401）时自动换票重试一次。"""
+        return self._ai_request("POST", path, body=body, timeout=timeout)
 
     def api_put_ai(self, path: str, body: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
-        """AI 域 PUT。"""
-        try:
-            headers = {}
-            if self.ai_token:
-                headers["Authorization"] = f"Bearer {self.ai_token}"
-            resp = self.session.put(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            log(f"PUT(AI) {path} 异常: {e}", "ERROR")
-        return None
+        """AI 域 PUT；登录态失效（含 body 级 code=401）时自动换票重试一次。"""
+        return self._ai_request("PUT", path, body=body, timeout=timeout)
 
     # ==================== 资源库域 API ====================
 
@@ -537,10 +755,46 @@ class ZjyClient:
                 return rows
         return []
 
-    def zyk_get_course_tree(self, course_info_id: str) -> list:
+    def zyk_get_cell_file_url(self, cell_id: str) -> str:
+        """资源库相对短链课件即时解析:GET teacher/courseContent/{cellId} → 绝对 fileUrl
+
+        抓包实证(2026-09-19,11 门资源库课 2192 个课件叶子普查):树/列表接口的 fileUrl 有四种
+        形态——绝对 URL(630)、`doc|zyk/g@<HEX>.ext`(845)、`doc/e@<HEX>.ext`(558)、空(159)。
+        后两类相对短链 = 未绑定知识点(knowledgePointsId 为空)的那批资源,平台库里只存相对键,
+        仅在"点开单课件"的详情接口里即时解析(目录分片号不可推导,本地拼前缀必 404)。
+        该接口不校验课程归属,学生号 zyk_token 即可;只读、无副作用。
+        返回:绝对地址;其余一律 ""(无 token / 非 200 / 仍是相对 / 异常)交调用方回落原兜底。
+        """
+        if not cell_id:
+            return ""
+        if not self.zyk_token and not self.auth_zyk_domain():
+            return ""
+        try:
+            data = self.api_get_zyk(f"teacher/courseContent/{cell_id}")
+        except Exception:
+            return ""
+        inner = data.get("data") if isinstance(data, dict) else None
+        url = inner.get("fileUrl") if isinstance(inner, dict) else ""
+        return url if str(url or "").startswith("http") else ""
+
+    def _zyk_children(self, node: dict, depth: int, course_info_id: str):
+        """资源库树单层子节点:GET teacher/courseContent/studyList。非空列表才返回。"""
+        children = self.api_get_zyk("teacher/courseContent/studyList", {
+            "level": depth + 1,
+            "parentId": node.get("id"),
+            "courseInfoId": course_info_id,
+        })
+        return children if isinstance(children, list) and children else None
+
+    def zyk_get_course_tree(self, course_info_id: str, leaf_workers: Optional[int] = None) -> list:
         """资源库课程树:先拉 studyMoudleList 取模块,再递归 studyList 取子节点。
 
         返回扁平化的叶子节点列表。
+
+        `leaf_workers>=2` 时改走"按层并发"的 BFS:下一层的节点 id 来自上一层响应,
+        层与层之间的数据依赖锁死必须串行,但**同一层的父节点之间可以并发**——
+        实测一门 1004 叶的课要 1191 次请求,串行 DFS 104.8 秒,16 路按层并发压到个位数秒。
+        默认 None = 原串行递归(逐字不变),调用方按课程类型自行决定是否放宽。
         """
         if not self.zyk_token and not self.auth_zyk_domain():
             return []
@@ -551,41 +805,77 @@ class ZjyClient:
             if not isinstance(modules, list):
                 modules = []
 
+            # 中间层 fileType="子节点" 不是叶子,必须继续递归到最深层
             def _recurse(nodes, depth=0):
                 if depth > 10:  # 防止无限递归
                     return
                 for node in nodes or []:
                     node["_depth"] = depth
-                    children = self.api_get_zyk("teacher/courseContent/studyList", {
-                        "level": depth + 1,
-                        "parentId": node.get("id"),
-                        "courseInfoId": course_info_id,
-                    })
-                    if isinstance(children, list) and children:
+                    children = self._zyk_children(node, depth, course_info_id)
+                    if children:
                         node["children"] = children
                         _recurse(children, depth + 1)
                     else:
                         leaves.append(node)
 
-            _recurse(modules)
+            if not leaf_workers or leaf_workers < 2:
+                _recurse(modules)
+                return leaves
+
+            frontier = [(m, 0) for m in (modules or [])]
+            while frontier:
+                with ThreadPoolExecutor(max_workers=min(int(leaf_workers), len(frontier))) as _ex:
+                    probed = list(_ex.map(
+                        lambda it: (it[0], it[1], self._zyk_children(it[0], it[1], course_info_id)),
+                        frontier))
+                nxt = []
+                for node, depth, children in probed:
+                    node["_depth"] = depth
+                    if children and depth <= 10:
+                        node["children"] = children
+                        nxt.extend([(ch, depth + 1) for ch in children])
+                    else:
+                        leaves.append(node)
+                frontier = nxt
         except Exception as e:
             log(f"zyk_get_course_tree 异常: {e}", "ERROR")
         return leaves
 
     def get_course_cells(self, course_info_id: str, class_id: str, course_id: str,
-                          include_completed: bool = False, ctype: str = "SPOC") -> list:
+                          include_completed: bool = False, ctype: str = "SPOC",
+                          leaf_workers: Optional[int] = None) -> list:
         """获取课程的叶子节点(可刷课的课件单元)。
 
         :param include_completed: True 包含已完成的(speed>=100)
+        :param leaf_workers: 资源库树扫描的按层并发度(仅 RESOURCE 生效,None=原串行)
         :return: 叶子节点列表,每个含 id/name/fileType/fileUrl/_speed 等字段
         """
         # 资源库域:直接用 zyk_get_course_tree 返回的叶子节点
         if ctype == "RESOURCE":
-            leaves = self.zyk_get_course_tree(course_info_id)
-            leaf_cells = [l for l in leaves if (l.get("fileType") or "") not in ["作业", "考试", "测验", "exam", "homework"]]
+            if not self.zyk_token and not self.auth_zyk_domain():
+                log(f"[扫描-RESOURCE] 资源库域换票失败：{self.zyk_auth_msg or '未知原因'}"
+                    f" ⇒ 读不到课件树（这不是「没有课件」），请重新登录后再刷", "ERROR")
+                return []
+            leaves = self.zyk_get_course_tree(course_info_id, leaf_workers=leaf_workers)
+            # 2026-09-23 真机定口径：平台 studySpeed 的分母 = **全部叶子 −「作业」格**，
+            # 测验/考试/讨论都在分母内（25 门课反算吻合；把 1 个测验格标满后该课 99→100）。
+            # 而作业格压根不是课件：两种心跳形都被平台回 code=400「不存在该课件！」，且不计进度。
+            # 旧写法把 考试/测验 一并剔出扫描 ⇒ 这两类格永远补不满，课最多只能到 96~99%。
+            leaf_cells = [l for l in leaves if (l.get("fileType") or "") not in ["作业", "exam", "homework"]]
+            # 已刷过的资源库课,叶子上带 studentStudyRecord(含 speed/actualNum/totalNum)。
+            # 早先这里无条件写 _speed=0,等于告诉调用方"全课都没刷过",于是每点一次刷课
+            # 就把全课几千格重打一遍;现按平台口径回填,读不到时仍是 0(只多刷不漏刷)。
             for l in leaf_cells:
-                l["_speed"] = 0
+                _ssr = l.get("studentStudyRecord")
+                _sp = _ssr.get("speed") if isinstance(_ssr, dict) else None
+                try:
+                    l["_speed"] = float(_sp) if _sp is not None else 0
+                except (TypeError, ValueError):
+                    l["_speed"] = 0
                 l.setdefault("fileUrl", "")
+            # RESOURCE 分支提前 return,走不到下面通用的"已完成"过滤，必须在此自己过
+            if not include_completed:
+                leaf_cells = [l for l in leaf_cells if l.get("_speed", 0) < 100]
             log(f"[扫描-RESOURCE] 资源库叶子节点={len(leaf_cells)} (已过滤作业/考试/测验)", "INFO")
             return leaf_cells
 
@@ -649,6 +939,13 @@ class ZjyClient:
                     if ftype == "知识点讲解" and ctype != "MOOC":
                         r["_is_knowledge_explain"] = True
                     leaf_cells.append(r)
+
+        # MOOC 课件树全部走 AI 域；先确保有票，无票时逐容器请求只会拿到"业务码 401/空列表"，
+        # 结果被误读成"这门课没课件"。这里显式失败并给出平台原话。
+        if ctype == "MOOC" and not self.ensure_ai_token():
+            log(f"[扫描-MOOC] AI 域换票失败：{self.ai_auth_msg or '未知原因'}"
+                f" ⇒ 读不到课件树（这不是「没有课件」），请重新登录后再刷", "ERROR")
+            return []
 
         rows_l1 = self._fetch_course_tree_level(course_info_id, class_id, course_id, 1, "0", ctype)
         if rows_l1:
@@ -1948,6 +2245,21 @@ class ZjyClient:
 
 
 # ==================== 模块级辅助函数 ====================
+
+def _passlogin_reject(data) -> str:
+    """把 passLogin 的"换票被拒"翻成一句人话（平台原话优先）。
+
+    实测登录态过期时回 HTTP 200 + `{"code":200,"data":{"allowLogin":false,
+    "notAllowLoginMsg":"用户信息为空！"}}`：HTTP 与业务 code 都"成功"，只有 data 里在拒绝。
+    """
+    d = (data or {}).get("data") if isinstance(data, dict) else None
+    if isinstance(d, dict):
+        msg = str(d.get("notAllowLoginMsg") or "").strip()
+        if msg:
+            return msg + ("（登录态已过期，请重新登录）" if d.get("allowLogin") is False else "")
+    code = (data or {}).get("code") if isinstance(data, dict) else None
+    return f"平台未返回 access_token（code={code}）"
+
 
 def _extract_access_token(data: dict) -> Optional[str]:
     """从 passLogin 响应中提取 access_token,兼容 dict 和 str 两种 data 格式。"""
