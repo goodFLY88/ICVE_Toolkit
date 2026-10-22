@@ -105,20 +105,36 @@ def auto_install_deps() -> bool:
         return True
     log(f'  [自动登录] 正在自动安装缺失依赖: {" ".join(pkgs)}(需联网,请耐心等待)', 'INFO')
     try:
-        r = subprocess.run([sys.executable, '-m', 'pip', 'install', *pkgs])
+        # 加超时,避免网络挂起时无限卡死(装依赖是可选动作,卡死不如转人工兜底)
+        r = subprocess.run([sys.executable, '-m', 'pip', 'install', *pkgs], timeout=600)
         if r.returncode != 0:
             log('  [自动登录] pip 安装失败,请手动执行: pip install -r requirements.txt', 'WARNING')
             return False
-        if 'playwright' in pkgs:
+        if 'playwright' in pkgs and not _chromium_installed():
             log('  [自动登录] 正在下载 Chromium 浏览器内核(约 150MB)...', 'INFO')
-            r = subprocess.run([sys.executable, '-m', 'playwright', 'install', 'chromium'])
+            r = subprocess.run([sys.executable, '-m', 'playwright', 'install', 'chromium'], timeout=900)
             if r.returncode != 0:
                 log('  [自动登录] Chromium 安装失败,请手动执行: playwright install chromium', 'WARNING')
                 return False
+    except subprocess.TimeoutExpired:
+        log('  [自动登录] 自动安装超时,转入人工登录', 'WARNING')
+        return False
     except Exception as e:
         log(f'  [自动登录] 自动安装异常: {e}', 'WARNING')
         return False
     return _bind_deps()
+
+
+def _chromium_installed() -> bool:
+    """探测 Chromium 内核是否已就位(避免已装时重复下载 ~150MB)。"""
+    try:
+        from playwright.sync_api import sync_playwright as _sp
+        with _sp() as _p:
+            _p.chromium.executable_path
+        return True
+    except Exception:
+        # 无法确认就视为未装,交由 install 兜底(幂等)
+        return False
 
 # ==================== 实证常量(照抄 bench15,勿调) ====================
 

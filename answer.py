@@ -715,7 +715,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
         if student_data_json:
             try:
                 student_opts = json.loads(student_data_json) if isinstance(student_data_json, str) else student_data_json
-            except:
+            except Exception:
                 pass
 
         if type_id in ["1", "2"]:
@@ -728,7 +728,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                     if cq_data:
                         try:
                             classmate_opts = json.loads(cq_data) if isinstance(cq_data, str) else cq_data
-                        except:
+                        except Exception:
                             pass
                 full_opts = []
                 ans_sos_set = set(x.strip() for x in final_answer.split(",") if x.strip())
@@ -752,7 +752,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                     if cq_data:
                         try:
                             classmate_opts = json.loads(cq_data) if isinstance(cq_data, str) else cq_data
-                        except:
+                        except Exception:
                             pass
                 full_opts = []
                 ans_val = str(raw_answer).strip()
@@ -779,7 +779,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                     parsed = json.loads(str(raw_answer))
                     if isinstance(parsed, list):
                         ans_list = [str(x) for x in parsed]
-                except:
+                except Exception:
                     pass
             if not ans_list and type_id == "4" and classmate_q:
                 cq_data = classmate_q.get("dataJson") or classmate_q.get("optionSort")
@@ -790,7 +790,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                             extracted = [str(opt.get("Content", "")).strip() for opt in cq_opts]
                             if any(extracted):
                                 ans_list = extracted
-                    except:
+                    except Exception:
                         pass
             if not ans_list and raw_answer:
                 if "," in str(raw_answer):
@@ -912,7 +912,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                     rows2 = rec_data2["data"] if isinstance(rec_data2["data"], list) else rec_data2["data"].get("rows", [])
                     if rows2:
                         record_id = rows2[0].get("id") or rows2[0].get("recordId")
-            except:
+            except Exception:
                 pass
 
         interval = 10
@@ -933,7 +933,7 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
                 if result and result.get("code") == 200:
                     spoc_success += 1
                     spoc_fail_streak = 0
-            except:
+            except Exception:
                 spoc_fail_streak += 1
             if spoc_fail_streak >= 5:
                 log(f"[{nickname}] SPOC updateExamTime连续5次失败,熔断停止 (已完成{spoc_success}/{rounds})", "WARNING")
@@ -944,40 +944,6 @@ def _submit_spoc_exam(client: ZjyClient, nickname: str, exam_id: str,
             log(f"[{nickname}] SPOC updateExamTime: {spoc_success}/{rounds}次成功, 累计约{spoc_success * interval}秒", "INFO")
 
     return {"code": 200, "msg": "提交成功"} if submitted else {"code": 500, "msg": "提交失败"}
-
-
-# ==================== 提交记录构建 ====================
-
-def _build_submit_records(questions: list) -> list:
-    """构建 taskExamProblemRecordList,每题含 questionNo/paperId/answer/optionSort。
-
-    :param questions: 题目列表
-    :return: 提交记录列表
-    """
-    records = []
-    for idx, q in enumerate(questions):
-        type_id = _get_type_id(q)
-        paper_id = str(q.get("paperId") or q.get("id") or q.get("questionId") or "")
-        answer = _convert_answer_for_submit(q, type_id)
-
-        record = {
-            "questionNo": idx,
-            "paperId": paper_id,
-            "answer": answer,
-            "optionSort": "",
-        }
-
-        # optionSort: 仅选择题(typeId=1/2)需要,从 dataJson 或 optionSort 字段提取
-        if type_id in ("1", "2") and answer:
-            opt_sort = q.get("optionSort") or q.get("dataJson") or ""
-            if opt_sort:
-                if isinstance(opt_sort, str):
-                    record["optionSort"] = opt_sort
-                else:
-                    record["optionSort"] = json.dumps(opt_sort, ensure_ascii=False)
-
-        records.append(record)
-    return records
 
 
 # ==================== 答案格式转换 ====================

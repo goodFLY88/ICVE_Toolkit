@@ -799,7 +799,7 @@ def _brush_classroom_discussion(client: ZjyClient, nickname: str, class_id: str,
                 if res and res.get("code") == 200:
                     count += 1
                     log(f"[{nickname}] 💬 回复课堂讨论 ✅ {title}", "INFO")
-                time.sleep(0.3)
+                time.sleep(random.uniform(0.2, 0.5))
     return count
 
 
@@ -810,7 +810,8 @@ def _brush_mooc_discussion(client: ZjyClient, nickname: str,
     count = 0
     page = 1
     all_discuss = []
-    while True:
+    # 防御:平台偶发不回 total 或返回非数字,并加页数硬顶防止接口忽略 pageNum 时死循环
+    while page <= 100:
         data = client.api_get_ai("course/courseInfoDiscuss/list", {
             "courseId": course_id, "courseInfoId": course_info_id,
             "pageNum": str(page), "pageSize": "20", "discussType": "4",
@@ -820,8 +821,14 @@ def _brush_mooc_discussion(client: ZjyClient, nickname: str,
         if not rows:
             break
         all_discuss.extend(rows)
-        total = data.get("total") if isinstance(data, dict) else 0
-        if len(all_discuss) >= total or len(rows) < 20:
+        total = 0
+        if isinstance(data, dict):
+            try:
+                total = int(data.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+        # total 无效(0/负数)时仅以"满页"判断;否则累计达到 total 即停止
+        if (total > 0 and len(all_discuss) >= total) or len(rows) < 20:
             break
         page += 1
 
@@ -859,7 +866,7 @@ def _brush_mooc_discussion(client: ZjyClient, nickname: str,
         if res and res.get("code") == 200:
             count += 1
             log(f"[{nickname}] 💬 回复MOOC讨论 ✅ {d_title}", "INFO")
-        time.sleep(0.3)
+        time.sleep(random.uniform(0.2, 0.5))
     return count
 
 
@@ -895,5 +902,5 @@ def _brush_courseware_discussion(client: ZjyClient, nickname: str, class_id: str
 
         if posted and (count % 10 == 0 or idx == len(leaf_cells) - 1):
             log(f"[{nickname}] 💬 课件讨论回复中...(当前已累计回复 {count} 个讨论)", "INFO")
-        time.sleep(0.1)
+        time.sleep(random.uniform(0.05, 0.2))
     return count
